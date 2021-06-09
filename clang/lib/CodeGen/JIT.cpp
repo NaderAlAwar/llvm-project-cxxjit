@@ -1373,8 +1373,13 @@ struct CompilerData {
   }
 
   void *resolveFunction(const void *NTTPValues, const char **TypeStrings,
-                        unsigned Idx) {
+                        unsigned Idx, unsigned OptimizationLevel) {
     std::string SMName = instantiateTemplate(NTTPValues, TypeStrings, Idx);
+
+    auto *Instantiation = Consumer->getModule()->getFunction(SMName);
+    auto VariantSMName = llvm::Twine(SMName).concat(llvm::Twine(OptimizationLevel));
+    Instantiation->setName(VariantSMName);
+    SMName = VariantSMName.str();
 
     // Now we know the name of the symbol, check to see if we already have it.
     if (auto SpecSymbol = CJ->findSymbol(SMName))
@@ -1709,14 +1714,15 @@ llvm::DenseMap<const void *, std::unique_ptr<CompilerData>> TUCompilerData;
 struct InstInfo {
   InstInfo(const char *InstKey, const void *NTTPValues,
            unsigned NTTPValuesSize, const char **TypeStrings,
-           unsigned TypeStringsCnt)
+           unsigned TypeStringsCnt, unsigned OptimizationLevel)
     : Key(InstKey),
-      NTArgs(StringRef((const char *) NTTPValues, NTTPValuesSize)) {
+      NTArgs(StringRef((const char *) NTTPValues, NTTPValuesSize)),
+      OptimizationLevel(OptimizationLevel) {
     for (unsigned i = 0, e = TypeStringsCnt; i != e; ++i)
       TArgs.push_back(StringRef(TypeStrings[i]));
   }
 
-  InstInfo(const StringRef &R) : Key(R) { }
+  InstInfo(const StringRef &R) : Key(R), OptimizationLevel(0) { }
 
   // The instantiation key (these are always constants, so we don't need to
   // allocate storage for them).
@@ -1727,14 +1733,17 @@ struct InstInfo {
 
   // Vector of string type names.
   SmallVector<SmallString<32>, 1> TArgs;
+
+  unsigned OptimizationLevel;
 };
 
 struct ThisInstInfo {
   ThisInstInfo(const char *InstKey, const void *NTTPValues,
                unsigned NTTPValuesSize, const char **TypeStrings,
-               unsigned TypeStringsCnt)
+               unsigned TypeStringsCnt, unsigned OptimizationLevel)
     : InstKey(InstKey), NTTPValues(NTTPValues), NTTPValuesSize(NTTPValuesSize),
-      TypeStrings(TypeStrings), TypeStringsCnt(TypeStringsCnt) { }
+      TypeStrings(TypeStrings), TypeStringsCnt(TypeStringsCnt),
+      OptimizationLevel(OptimizationLevel) { }
 
   const char *InstKey;
 
@@ -1743,6 +1752,8 @@ struct ThisInstInfo {
 
   const char **TypeStrings;
   unsigned TypeStringsCnt;
+
+  unsigned OptimizationLevel;
 };
 
 struct InstMapInfo {
@@ -1765,6 +1776,8 @@ struct InstMapInfo {
     for (auto &TA : II.TArgs)
       h = hash_combine(h, hash_combine_range(TA.begin(), TA.end()));
 
+    h = hash_combine(h, II.OptimizationLevel);
+
     return (unsigned) h;
   }
   
@@ -1784,13 +1797,16 @@ struct InstMapInfo {
                                           TII.TypeStrings[i] +
                                             std::strlen(TII.TypeStrings[i])));
 
+    h = hash_combine(h, TII.OptimizationLevel);
+
     return (unsigned) h;
   }
 
   static bool isEqual(const InstInfo &LHS, const InstInfo &RHS) {
     return LHS.Key    == RHS.Key &&
            LHS.NTArgs == RHS.NTArgs &&
-           LHS.TArgs  == RHS.TArgs;
+           LHS.TArgs  == RHS.TArgs &&
+           LHS.OptimizationLevel == RHS.OptimizationLevel;
   }
 
   static bool isEqual(const ThisInstInfo &LHS, const InstInfo &RHS) {
@@ -1809,12 +1825,21 @@ struct InstMapInfo {
       if (II.TArgs[i] != StringRef(TII.TypeStrings[i]))
         return false;
 
+    if (II.OptimizationLevel != TII.OptimizationLevel)
+      return false;
+
     return true; 
   }
 };
 
 llvm::sys::SmartMutex<false> IMutex;
 llvm::DenseMap<InstInfo, void *, InstMapInfo> Instantiations;
+
+unsigned CurrentOptLevel = 0;
+
+unsigned getOptimizationLevel() {
+  return CurrentOptLevel++ % 4;
+}
 
 } // anonymous namespace
 
@@ -1831,14 +1856,23 @@ void *__clang_jit(const void *CmdArgs, unsigned CmdArgsLen,
                   const void *NTTPValues, unsigned NTTPValuesSize,
                   const char **TypeStrings, unsigned TypeStringsCnt,
                   const char *InstKey, unsigned Idx) {
+  unsigned OptimizationLevel = getOptimizationLevel();
+  llvm::errs() << "JIT: set optimization level to " << OptimizationLevel << '\n';
+
   {
     llvm::MutexGuard Guard(IMutex);
     auto II =
       Instantiations.find_as(ThisInstInfo(InstKey, NTTPValues, NTTPValuesSize,
-                                          TypeStrings, TypeStringsCnt));
-    if (II != Instantiations.end())
+                                          TypeStrings, TypeStringsCnt, OptimizationLevel));
+    if (II != Instantiations.end()) {
+      llvm::errs() << "got it\n";
+      if (II->second == nullptr || II->second == NULL)
+        llvm::errs() << "wtf\n";
       return II->second;
+    }
   }
+
+  llvm::errs() << "JIT: could not find instantiation with optimization level " << OptimizationLevel << '\n';
 
   llvm::MutexGuard Guard(Mutex);
 
@@ -1853,22 +1887,24 @@ void *__clang_jit(const void *CmdArgs, unsigned CmdArgsLen,
   }
 
   CompilerData *CD;
-  auto TUCDI = TUCompilerData.find(ASTBuffer);
-  if (TUCDI == TUCompilerData.end()) {
+  // commented out because we need to create a new module for each variant
+  // auto TUCDI = TUCompilerData.find(ASTBuffer);
+  // if (TUCDI == TUCompilerData.end()) {
     CD = new CompilerData(CmdArgs, CmdArgsLen, ASTBuffer, ASTBufferSize,
                           IRBuffer, IRBufferSize, LocalPtrs, LocalPtrsCnt,
                           LocalDbgPtrs, LocalDbgPtrsCnt, DeviceData, DevCnt);
-    TUCompilerData[ASTBuffer].reset(CD);
-  } else {
-    CD = TUCDI->second.get();
-  }
+    // TUCompilerData[ASTBuffer].reset(CD);
+  // } else {
+    // CD = TUCDI->second.get();
+  // }
 
-  void *FPtr = CD->resolveFunction(NTTPValues, TypeStrings, Idx);
+  CD->Invocation->getCodeGenOpts().OptimizationLevel = OptimizationLevel;
+  void *FPtr = CD->resolveFunction(NTTPValues, TypeStrings, Idx, OptimizationLevel);
 
   {
     llvm::MutexGuard Guard(IMutex);
     Instantiations[InstInfo(InstKey, NTTPValues, NTTPValuesSize,
-                            TypeStrings, TypeStringsCnt)] = FPtr;
+                            TypeStrings, TypeStringsCnt, OptimizationLevel)] = FPtr;
   }
 
   return FPtr;
