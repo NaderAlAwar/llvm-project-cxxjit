@@ -1865,9 +1865,6 @@ void *__clang_jit(const void *CmdArgs, unsigned CmdArgsLen,
       Instantiations.find_as(ThisInstInfo(InstKey, NTTPValues, NTTPValuesSize,
                                           TypeStrings, TypeStringsCnt, OptimizationLevel));
     if (II != Instantiations.end()) {
-      llvm::errs() << "got it\n";
-      if (II->second == nullptr || II->second == NULL)
-        llvm::errs() << "wtf\n";
       return II->second;
     }
   }
