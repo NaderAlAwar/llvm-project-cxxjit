@@ -52,6 +52,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Bitcode/BitcodeReader.h"
@@ -1408,6 +1409,9 @@ struct CompilerData {
             nullptr, 0, nullptr, 0, nullptr, 0, DeviceData, DevCnt, BestDevIdx));
       }
     }
+
+    if (Invocation->getFrontendOpts().ShowStats || !Invocation->getFrontendOpts().StatsFile.empty())
+      llvm::EnableStatistics(false);
   }
 
   void restoreFuncDeclContext(FunctionDecl *FunD) {
@@ -2181,6 +2185,26 @@ struct CompilerData {
     if (Linker::linkModules(*RunningMod, Consumer->takeModule(),
                             Linker::Flags::OverrideFromSrc))
       fatal();
+
+    StringRef StatsFile = Invocation->getFrontendOpts().StatsFile;
+    if (!StatsFile.empty()) {
+      std::string VariantStatsFile = llvm::Twine(StatsFile)
+                                    .concat(llvm::Twine('.'))
+                                    .concat(llvm::Twine(FuncMap[Idx]->getName()))
+                                    .concat(llvm::Twine('.'))
+                                    .concat(llvm::Twine(Invocation->getCodeGenOpts().OptimizationLevel))
+                                    .str();
+
+      std::error_code EC;
+      auto StatS = llvm::make_unique<llvm::raw_fd_ostream>(VariantStatsFile, EC,
+                                                          llvm::sys::fs::F_Text);
+      if (EC) {
+        Diagnostics->Report(diag::warn_fe_unable_to_open_stats_file)
+            << VariantStatsFile << EC.message();
+      } else {
+        llvm::PrintStatisticsJSON(*StatS);
+      }
+    }
 
     Consumer->Initialize(*Ctx);
 
