@@ -41,7 +41,8 @@ namespace clang {
                          const TargetOptions &TOpts, const LangOptions &LOpts,
                          const llvm::DataLayout &TDesc, llvm::Module *M,
                          BackendAction Action,
-                         std::unique_ptr<raw_pwrite_stream> OS);
+                         std::unique_ptr<raw_pwrite_stream> OS,
+                         StringRef PassPipeline = "");
 
   void EmbedBitcode(llvm::Module *M, const CodeGenOptions &CGOpts,
                     llvm::MemoryBufferRef Buf);

@@ -85,6 +85,8 @@
 #include "llvm/Support/DynamicLibrary.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FormatAdapters.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/Host.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -558,7 +560,7 @@ public:
     Gen->HandleVTable(RD);
   }
 
-  void EmitOptimized() {
+  void EmitOptimized(StringRef PassPipeline) {
     // Copied from HandleTranslationUnit in CodeGenAction.cpp
 
     LLVMContext &Ctx = getModule()->getContext();
@@ -597,7 +599,8 @@ public:
     EmitBackendOutput(Diags, HeaderSearchOpts, CodeGenOpts, TargetOpts,
                       LangOpts, Context->getTargetInfo().getDataLayout(),
                       getModule(), Action,
-                      llvm::make_unique<llvm::buffer_ostream>(*AsmOutStream));
+                      llvm::make_unique<llvm::buffer_ostream>(*AsmOutStream),
+                      PassPipeline);
 
     Ctx.setInlineAsmDiagnosticHandler(OldHandler, OldContext);
 
@@ -1065,6 +1068,22 @@ public:
 
 unsigned LastUnique = 0;
 std::unique_ptr<llvm::LLVMContext> LCtx;
+std::vector<StringRef> OptimizationPasses;
+constexpr int PipelineSize = 5;
+
+void InitOptimizationPasses() {
+  // 155 is the number of passes in PassRegistry.def
+  OptimizationPasses.reserve(121);
+  #define MODULE_PASS(NAME, CREATE_PASS) \
+    OptimizationPasses.emplace_back(NAME);
+  #define CGSCC_PASS(NAME, CREATE_PASS) \
+    OptimizationPasses.emplace_back(NAME);
+  #define FUNCTION_PASS(NAME, CREATE_PASS) \
+    OptimizationPasses.emplace_back(NAME);
+  #define LOOP_PASS(NAME, CREATE_PASS) \
+    OptimizationPasses.emplace_back(NAME);
+  #include "PassRegistry.def"
+}
 
 bool InitializedDevTarget = false;
 
@@ -1164,6 +1183,7 @@ struct CompilerData {
                                  CC1Args.size(), *Diagnostics);
     Invocation->getFrontendOpts().DisableFree = false;
     Invocation->getCodeGenOpts().DisableFree = false;
+    Invocation->getCodeGenOpts().ExperimentalNewPassManager = 1;
 
     InMemoryFileSystem = new llvm::vfs::InMemoryFileSystem;
     FileMgr = new FileManager(FileSystemOptions(), InMemoryFileSystem);
@@ -1414,6 +1434,63 @@ struct CompilerData {
       llvm::EnableStatistics(false);
   }
 
+  std::string joinPasses(const SmallVectorImpl<StringRef> &Passes, StringRef Prefix, int NumParens) {
+    if (Passes.size() == 0)
+      return "";
+
+    return formatv("{0}{1:$[,]}{2}", Prefix, make_range(Passes.begin(), Passes.end()), fmt_repeat(")", NumParens));
+  }
+
+  std::string buildPassPipeline(int VariantIdx) {
+    SmallVector<StringRef, 5> ModulePasses;
+    SmallVector<StringRef, 5> CGSCCPasses;
+    SmallVector<StringRef, 5> FunctionPasses;
+    SmallVector<StringRef, 5> LoopPasses;
+
+    for (int i = 0; i < PipelineSize; i++) {
+      int OptIdx = (VariantIdx + (i * 31)) % OptimizationPasses.size();
+      StringRef Opt = OptimizationPasses[OptIdx];
+
+      if (OptIdx < 36)
+        ModulePasses.push_back(Opt);
+      else if (OptIdx < 41)
+        CGSCCPasses.push_back(Opt);
+      else if (OptIdx < 106)
+        FunctionPasses.push_back(Opt);
+      else
+        LoopPasses.push_back(Opt);
+    }
+
+    std::string ModulePassesStr = joinPasses(ModulePasses, "module(", 1);
+    std::string CGSCCPassesStr = joinPasses(CGSCCPasses, "module(cgscc(", 2);
+    std::string FunctionPassesStr = joinPasses(FunctionPasses, "module(cgscc(function(", 3);
+    std::string LoopPassesStr = joinPasses(LoopPasses, "module(cgscc(function(loop(", 4);
+
+    std::string PassPipeline = "";
+    if (ModulePassesStr != "")
+      PassPipeline = ModulePassesStr;
+
+    if (CGSCCPassesStr != "") {
+      if (PassPipeline != "")
+        PassPipeline += ",";
+      PassPipeline += CGSCCPassesStr;
+    }
+
+    if (FunctionPassesStr != "") {
+      if (PassPipeline != "")
+        PassPipeline += ",";
+      PassPipeline += FunctionPassesStr;
+    }
+
+    if (LoopPassesStr != "") {
+      if (PassPipeline != "")
+        PassPipeline += ",";
+      PassPipeline += LoopPassesStr;
+    }
+
+    return PassPipeline;
+  }
+
   void restoreFuncDeclContext(FunctionDecl *FunD) {
     // NOTE: This mirrors the corresponding code in
     // Parser::ParseLateTemplatedFuncDef (which is used to late parse a C++
@@ -1447,7 +1524,7 @@ struct CompilerData {
   }
 
   std::string instantiateTemplate(const void *NTTPValues, const char **TypeStrings,
-                                  unsigned Idx) {
+                                  unsigned Idx, unsigned &VariantIdx) {
     FunctionDecl *FD = FuncMap[Idx];
     if (!FD)
       fatal();
@@ -1523,7 +1600,6 @@ struct CompilerData {
     SmallVector<TemplateArgument, 8> Builder;
 
     unsigned TAIdx = 0, TSIdx = 0;
-    unsigned OptimizationLevel = 3;
     for (auto &TA : FTSI->TemplateArguments->asArray()) {
       auto HandleTA = [&](const TemplateArgument &TA,
                           SmallVector<TemplateArgument, 8> &Builder) {
@@ -1570,7 +1646,7 @@ struct CompilerData {
 
         if (TAIsSaved[TAIdx++] != TASK_Value) {
           Builder.push_back(TA);
-          OptimizationLevel = TA.getAsIntegral().getExtValue();
+          VariantIdx = TA.getAsIntegral().getExtValue();
           return;
         }
 
@@ -1598,7 +1674,7 @@ struct CompilerData {
           llvm::APSInt SIntVal(IntVal,
                                FieldTy->isUnsignedIntegerOrEnumerationType());
           Builder.push_back(TemplateArgument(*Ctx, SIntVal, CanonFieldTy));
-          OptimizationLevel = SIntVal.getExtValue();
+          VariantIdx = SIntVal.getExtValue();
         } else {
           assert(FieldTy->isPointerType() || FieldTy->isReferenceType() ||
                  FieldTy->isNullPtrType());
@@ -1768,8 +1844,7 @@ struct CompilerData {
       HandleTA(TA, Builder);
     }
 
-    llvm::errs() << "JIT: setting optimization level to " << OptimizationLevel << '\n';
-    Invocation->getCodeGenOpts().OptimizationLevel = OptimizationLevel;
+    llvm::errs() << "JIT: selecting variant index " << VariantIdx << '\n';
 
     SourceLocation Loc = FTSI->getPointOfInstantiation();
     auto *NewTAL = TemplateArgumentList::CreateCopy(*Ctx, Builder);
@@ -1866,7 +1941,8 @@ struct CompilerData {
 
   void *resolveFunction(const void *NTTPValues, const char **TypeStrings,
                         unsigned Idx) {
-    std::string SMName = instantiateTemplate(NTTPValues, TypeStrings, Idx);
+    unsigned VariantIdx = 0;
+    std::string SMName = instantiateTemplate(NTTPValues, TypeStrings, Idx, VariantIdx);
 
     llvm::errs() << "JIT: searching for variant " << SMName << "...\n";
 
@@ -1878,7 +1954,7 @@ struct CompilerData {
     llvm::errs() << "JIT: not found, re-compiling\n";
 
     if (DevCD)
-      DevCD->instantiateTemplate(NTTPValues, TypeStrings, Idx);
+      DevCD->instantiateTemplate(NTTPValues, TypeStrings, Idx, VariantIdx);
 
     emitAllNeeded();
 
@@ -1895,11 +1971,14 @@ struct CompilerData {
     TopGV->setLinkage(llvm::GlobalValue::ExternalLinkage);
     TopGV->setComdat(nullptr);
 
+    std::string PassPipeline = buildPassPipeline(VariantIdx);
+    llvm::errs() << "JIT: Got Pipeline " << PassPipeline << '\n';
+
     // Finalize the module, generate module-level metadata, etc.
 
     if (DevCD) {
       DevCD->Consumer->HandleTranslationUnit(*DevCD->Ctx);
-      DevCD->Consumer->EmitOptimized();
+      DevCD->Consumer->EmitOptimized(PassPipeline);
 
       // We have now created the PTX output, but what we really need as a
       // fatbin that the CUDA runtime will recognize.
@@ -2154,7 +2233,7 @@ struct CompilerData {
 
     // Optimize the merged module, containing both the newly generated IR as well as
     // previously emitted code marked available_externally.
-    Consumer->EmitOptimized();
+    Consumer->EmitOptimized(PassPipeline);
 
     std::unique_ptr<llvm::Module> ToRunMod =
         llvm::CloneModule(*Consumer->getModule());
@@ -2192,7 +2271,7 @@ struct CompilerData {
                                     .concat(llvm::Twine('.'))
                                     .concat(llvm::Twine(FuncMap[Idx]->getName()))
                                     .concat(llvm::Twine('.'))
-                                    .concat(llvm::Twine(Invocation->getCodeGenOpts().OptimizationLevel))
+                                    .concat(llvm::Twine(VariantIdx))
                                     .str();
 
       std::error_code EC;
@@ -2355,6 +2434,9 @@ void *__clang_jit(const void *CmdArgs, unsigned CmdArgsLen,
     if (II != Instantiations.end()) {
       return II->second;
     }
+
+    if (OptimizationPasses.size() == 0)
+      InitOptimizationPasses();
   }
 
   llvm::errs() << "JIT: compiling new variant ...\n";

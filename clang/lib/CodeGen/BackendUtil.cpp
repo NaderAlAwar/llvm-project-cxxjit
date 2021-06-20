@@ -147,7 +147,8 @@ public:
                     std::unique_ptr<raw_pwrite_stream> OS);
 
   void EmitAssemblyWithNewPassManager(BackendAction Action,
-                                      std::unique_ptr<raw_pwrite_stream> OS);
+                                      std::unique_ptr<raw_pwrite_stream> OS,
+                                      StringRef PassPipeline);
 
   void FinalizeForJIT();
 };
@@ -1249,7 +1250,7 @@ void addSanitizersAtO0(ModulePassManager &MPM, const Triple &TargetTriple,
 /// This API is planned to have its functionality finished and then to replace
 /// `EmitAssembly` at some point in the future when the default switches.
 void EmitAssemblyHelper::EmitAssemblyWithNewPassManager(
-    BackendAction Action, std::unique_ptr<raw_pwrite_stream> OS) {
+    BackendAction Action, std::unique_ptr<raw_pwrite_stream> OS, StringRef PassPipeline) {
   TimeRegion Region(FrontendTimesIsEnabled ? &CodeGenerationTime : nullptr);
   setCommandLineOpts(CodeGenOpts);
 
@@ -1322,7 +1323,13 @@ void EmitAssemblyHelper::EmitAssemblyWithNewPassManager(
 
   ModulePassManager MPM(CodeGenOpts.DebugPassManager);
 
-  if (!CodeGenOpts.DisableLLVMPasses) {
+  if (!PassPipeline.empty()) {
+    // If VerifyEachPass is true a hasComdat assertion in the Verifier will fail
+    if (auto Err = PB.parsePassPipeline(MPM, PassPipeline, /*VerifyEachPass=*/false)) {
+      llvm::errs() << "JIT: Could not parse MPM pipeline " << PassPipeline
+                   << ". Reason: " << Err << '\n';
+    }
+  } else if (!CodeGenOpts.DisableLLVMPasses) {
     bool IsThinLTO = CodeGenOpts.PrepareForThinLTO;
     bool IsLTO = CodeGenOpts.PrepareForLTO;
 
@@ -1646,7 +1653,8 @@ void clang::EmitBackendOutput(DiagnosticsEngine &Diags,
                               const LangOptions &LOpts,
                               const llvm::DataLayout &TDesc, Module *M,
                               BackendAction Action,
-                              std::unique_ptr<raw_pwrite_stream> OS) {
+                              std::unique_ptr<raw_pwrite_stream> OS,
+                              StringRef PassPipeline) {
   std::unique_ptr<llvm::Module> EmptyModule;
   if (!CGOpts.ThinLTOIndexFile.empty()) {
     // If we are performing a ThinLTO importing compile, load the function index
@@ -1687,7 +1695,7 @@ void clang::EmitBackendOutput(DiagnosticsEngine &Diags,
   EmitAssemblyHelper AsmHelper(Diags, HeaderOpts, CGOpts, TOpts, LOpts, M);
 
   if (CGOpts.ExperimentalNewPassManager)
-    AsmHelper.EmitAssemblyWithNewPassManager(Action, std::move(OS));
+    AsmHelper.EmitAssemblyWithNewPassManager(Action, std::move(OS), PassPipeline);
   else
     AsmHelper.EmitAssembly(Action, std::move(OS));
 
