@@ -80,6 +80,7 @@
 #include "llvm/Option/OptTable.h"
 #include "llvm/Option/Option.h"
 #include "llvm/Pass.h"
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/DynamicLibrary.h"
@@ -1068,21 +1069,262 @@ public:
 
 unsigned LastUnique = 0;
 std::unique_ptr<llvm::LLVMContext> LCtx;
-std::vector<StringRef> OptimizationPasses;
-constexpr int PipelineSize = 5;
+
+enum JITPassType {
+  ModulePass = 0,
+  CGSCCPass,
+  FunctionPass,
+  LoopPass
+};
+
+struct JITPass {
+  StringRef Name;
+  JITPassType PassType;
+
+  JITPass(StringRef Name, JITPassType Type) : Name(Name), PassType(Type) {}
+};
+
+class JITPipeline {
+  std::vector<std::unique_ptr<JITPass>> Passes;
+
+public:
+  JITPipeline() {};
+
+  void addPass(const JITPass &JP) {
+    Passes.push_back(llvm::make_unique<JITPass>(JP.Name, JP.PassType));
+  }
+
+  void removePass(int Index) {
+    Passes.erase(Passes.begin() + Index);
+  }
+
+  void buildPassPipeline(PassBuilder::OptimizationLevel Level) {
+    // Passes and order copied from
+    // PassBuilder::buildModuleSimplificationPipeline
+
+    addPass({"forceattrs", ModulePass});
+    addPass({"inferattrs", ModulePass});
+    addPass({"simplify-cfg", FunctionPass});
+    addPass({"sroa", FunctionPass});
+    addPass({"early-cse", FunctionPass});
+    addPass({"lower-expect", FunctionPass});
+    if (Level == PassBuilder::O3)
+      addPass({"callsite-splitting", FunctionPass});
+
+    addPass({"ipsccp", ModulePass});
+    addPass({"called-value-propagation", ModulePass});
+    addPass({"globalopt", ModulePass});
+    addPass({"mem2reg", FunctionPass});
+    addPass({"deadargelim", ModulePass});
+    addPass({"instcombine", FunctionPass});
+    addPass({"simplify-cfg", FunctionPass});
+
+    addPass({"require<globals-aa>", ModulePass});
+    addPass({"require<profile-summary>", ModulePass});
+
+    addPass({"inline", CGSCCPass}); // TODO: need to pass args to inline
+    addPass({"function-attrs", CGSCCPass});
+
+    if (Level == PassBuilder::O3)
+      addPass({"argpromotion", CGSCCPass});
+
+    // Passes and order copied from
+    // PassBuilder::buildFunctionSimplificationPipeline
+
+    addPass({"sroa", FunctionPass});
+    addPass({"early-cse", FunctionPass}); // TODO: this takes a boolean argument
+
+    // TODO: GVNHoist? GVNSink?
+
+    addPass({"speculative-execution", FunctionPass});
+    addPass({"jump-threading", FunctionPass});
+    addPass({"correlated-propagation", FunctionPass});
+    addPass({"simplify-cfg", FunctionPass});
+
+    if (Level == PassBuilder::O3)
+      addPass({"aggressive-instcombine", FunctionPass});
+
+    addPass({"instcombine", FunctionPass});
+    addPass({"libcalls-shrinkwrap", FunctionPass});
+
+    addPass({"tailcallelim", FunctionPass});
+    addPass({"simplify-cfg", FunctionPass});
+
+    addPass({"reassociate", FunctionPass});
+    addPass({"require<opt-remark-emit>", FunctionPass});
+    addPass({"loop-instsimplify", LoopPass});
+    addPass({"simplify-cfg", LoopPass});
+    addPass({"rotate", LoopPass});
+    addPass({"unswitch", LoopPass});
+
+    addPass({"simplify-cfg", FunctionPass});
+    addPass({"instcombine", FunctionPass});
+
+    addPass({"indvars", LoopPass});
+    addPass({"loop-idiom", LoopPass});
+    addPass({"loop-deletion", LoopPass});
+
+    if (Level != PassBuilder::O1) {
+      addPass({"mldst-motion", FunctionPass});
+      addPass({"gvn", FunctionPass});
+    }
+
+    addPass({"memcpyopt", FunctionPass});
+    addPass({"sccp", FunctionPass});
+    addPass({"bdce", FunctionPass});
+    addPass({"instcombine", FunctionPass});
+
+    addPass({"jump-threading", FunctionPass});
+    addPass({"correlated-propagation", FunctionPass});
+    addPass({"dse", FunctionPass});
+    addPass({"licm", LoopPass});
+
+    addPass({"adce", FunctionPass});
+    addPass({"simplify-cfg", FunctionPass});
+    addPass({"instcombine", FunctionPass});
+
+    // TODO: devirt pass?
+
+    // Passes and order copied from
+    // PassBuilder::buildModuleOptimizationPipeline
+
+    addPass({"globalopt", ModulePass});
+    addPass({"globaldce", ModulePass});
+
+    // TODO: partial inlining?
+
+    addPass({"elim-avail-extern", ModulePass});
+    addPass({"rpo-functionattrs", ModulePass});
+    addPass({"require<globals-aa>", ModulePass});
+
+    addPass({"float2int", FunctionPass});
+    addPass({"rotate", LoopPass});
+    addPass({"loop-distribute", FunctionPass});
+    addPass({"loop-vectorize", FunctionPass});
+    addPass({"loop-load-elim", FunctionPass});
+    addPass({"instcombine", FunctionPass});
+    addPass({"simplify-cfg", FunctionPass}); // TODO: need to pass args here
+    addPass({"slp-vectorizer", FunctionPass});
+    addPass({"instcombine", FunctionPass});
+
+    addPass({"require<opt-remark-emit>", FunctionPass});
+    addPass({"licm", LoopPass});
+
+    // TODO: enableUnrollAndJam?
+
+    addPass({"unroll", FunctionPass}); // TODO: need to pass args here
+    addPass({"transform-warning", FunctionPass});
+    addPass({"instcombine", FunctionPass});
+    addPass({"require<opt-remark-emit>", FunctionPass});
+    addPass({"licm", LoopPass});
+
+    addPass({"alignment-from-assumptions", FunctionPass});
+    addPass({"loop-sink", FunctionPass});
+    addPass({"instsimplify", FunctionPass});
+    addPass({"div-rem-pairs", FunctionPass});
+    addPass({"simplify-cfg", FunctionPass});
+    addPass({"spec-phis", FunctionPass});
+
+    addPass({"cg-profile", ModulePass});
+
+    addPass({"globaldce", ModulePass});
+    addPass({"constmerge", ModulePass});
+
+    addPass({"canonicalize-aliases", ModulePass});
+    addPass({"name-anon-globals", ModulePass});
+  }
+
+  std::string getPassTypeString(JITPassType Type) {
+    if (Type == ModulePass)
+      return "module";
+    if (Type == CGSCCPass)
+      return "cgscc";
+    if (Type == FunctionPass)
+      return "function";
+    if (Type == LoopPass)
+      return "loop";
+  }
+
+  std::string toString() {
+    JITPassType CurrentType = ModulePass;
+    std::string Pipeline = "module(";
+
+    bool PassesOpen[4] = {true, false, false, false};
+
+    int index = 0;
+    for (const auto& Pass : Passes) {
+      if (Pass->PassType != CurrentType) {
+        if (Pass->PassType > CurrentType) {
+          Pipeline += getPassTypeString(Pass->PassType) + "(";
+          PassesOpen[Pass->PassType] = true;
+        }
+
+        else if (Pass->PassType < CurrentType) {
+          if (Pipeline.back() == ',')
+            Pipeline.pop_back();
+
+          int Parens = 0;
+          for (int i = Pass->PassType + 1; i <= CurrentType; i++) {
+            if (PassesOpen[i]) {
+              Parens++;
+              PassesOpen[i] = false;
+            }
+          }
+
+          while (Parens > 0) {
+            Pipeline += ")";
+            Parens--;
+          }
+
+          Pipeline += ',';
+        }
+      }
+
+      CurrentType = Pass->PassType;
+      Pipeline += Pass->Name.str();
+
+      if (index == Passes.size() - 1) {
+        int Parens = Pass->PassType - ModulePass + 1;
+        while (Parens > 0) {
+          Pipeline += ")";
+          Parens--;
+        }
+      }
+      else
+        Pipeline += ",";
+
+      index++;
+    }
+
+    return Pipeline;
+  }
+};
+
+std::vector<JITPass> OptimizationPasses;
+constexpr int PipelineSize = 1;
+int CurrentOpt = 0;
 
 void InitOptimizationPasses() {
-  // 155 is the number of passes in PassRegistry.def
-  OptimizationPasses.reserve(121);
+  // 109 is the number of passes in PassRegistry.def
+  OptimizationPasses.reserve(109);
   #define MODULE_PASS(NAME, CREATE_PASS) \
-    OptimizationPasses.emplace_back(NAME);
+    OptimizationPasses.emplace_back(NAME, ModulePass); \
+
   #define CGSCC_PASS(NAME, CREATE_PASS) \
-    OptimizationPasses.emplace_back(NAME);
+    OptimizationPasses.emplace_back(NAME, CGSCCPass); \
+
   #define FUNCTION_PASS(NAME, CREATE_PASS) \
-    OptimizationPasses.emplace_back(NAME);
+    OptimizationPasses.emplace_back(NAME, FunctionPass); \
+
   #define LOOP_PASS(NAME, CREATE_PASS) \
-    OptimizationPasses.emplace_back(NAME);
+    OptimizationPasses.emplace_back(NAME, LoopPass); \
+
   #include "PassRegistry.def"
+
+  #undef MODULE_PASS
+  #undef CGSCC_PASS
+  #undef FUNCTION_PASS
+  #undef LOOP_PASS
 }
 
 bool InitializedDevTarget = false;
@@ -1442,50 +1684,24 @@ struct CompilerData {
   }
 
   std::string buildPassPipeline(int VariantIdx) {
-    SmallVector<StringRef, 5> ModulePasses;
-    SmallVector<StringRef, 5> CGSCCPasses;
-    SmallVector<StringRef, 5> FunctionPasses;
-    SmallVector<StringRef, 5> LoopPasses;
+    std::string PassPipeline;
 
-    for (int i = 0; i < PipelineSize; i++) {
-      int OptIdx = (VariantIdx + (i * 31)) % OptimizationPasses.size();
-      StringRef Opt = OptimizationPasses[OptIdx];
-
-      if (OptIdx < 36)
-        ModulePasses.push_back(Opt);
-      else if (OptIdx < 41)
-        CGSCCPasses.push_back(Opt);
-      else if (OptIdx < 106)
-        FunctionPasses.push_back(Opt);
-      else
-        LoopPasses.push_back(Opt);
+    if (VariantIdx == 4) {
+      JITPipeline Pipeline;
+      Pipeline.buildPassPipeline(PassBuilder::O1);
+      PassPipeline = Pipeline.toString();
     }
 
-    std::string ModulePassesStr = joinPasses(ModulePasses, "module(", 1);
-    std::string CGSCCPassesStr = joinPasses(CGSCCPasses, "module(cgscc(", 2);
-    std::string FunctionPassesStr = joinPasses(FunctionPasses, "module(cgscc(function(", 3);
-    std::string LoopPassesStr = joinPasses(LoopPasses, "module(cgscc(function(loop(", 4);
-
-    std::string PassPipeline = "";
-    if (ModulePassesStr != "")
-      PassPipeline = ModulePassesStr;
-
-    if (CGSCCPassesStr != "") {
-      if (PassPipeline != "")
-        PassPipeline += ",";
-      PassPipeline += CGSCCPassesStr;
+    if (VariantIdx == 5) {
+      JITPipeline Pipeline;
+      Pipeline.buildPassPipeline(PassBuilder::O2);
+      PassPipeline = Pipeline.toString();
     }
 
-    if (FunctionPassesStr != "") {
-      if (PassPipeline != "")
-        PassPipeline += ",";
-      PassPipeline += FunctionPassesStr;
-    }
-
-    if (LoopPassesStr != "") {
-      if (PassPipeline != "")
-        PassPipeline += ",";
-      PassPipeline += LoopPassesStr;
+    if (VariantIdx == 6) {
+      JITPipeline Pipeline;
+      Pipeline.buildPassPipeline(PassBuilder::O3);
+      PassPipeline = Pipeline.toString();
     }
 
     return PassPipeline;
@@ -1971,8 +2187,14 @@ struct CompilerData {
     TopGV->setLinkage(llvm::GlobalValue::ExternalLinkage);
     TopGV->setComdat(nullptr);
 
-    std::string PassPipeline = buildPassPipeline(VariantIdx);
-    llvm::errs() << "JIT: Got Pipeline " << PassPipeline << '\n';
+    std::string PassPipeline = "";
+    // This is needed to pass the correct argument to the inlining pass
+    Invocation->getCodeGenOpts().OptimizationLevel = 1;
+
+    if (VariantIdx < 4)
+      Invocation->getCodeGenOpts().OptimizationLevel = VariantIdx;
+    else
+      PassPipeline = buildPassPipeline(VariantIdx);
 
     // Finalize the module, generate module-level metadata, etc.
 
