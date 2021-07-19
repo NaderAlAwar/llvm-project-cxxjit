@@ -72,6 +72,12 @@ public:
 
   ASTContext &getASTContext() const { return Context; }
 
+  llvm::DenseMap<const TagDecl*, uint64_t> getAnonStructIds() const { return AnonStructIds; }
+
+  void setAnonStructIds(llvm::DenseMap<const TagDecl*, uint64_t> AnonStructIds) {
+    this->AnonStructIds = AnonStructIds;
+  }
+
   DiagnosticsEngine &getDiags() const { return Diags; }
 
   virtual void startNewFunction() { LocalBlockIds.clear(); }

@@ -2160,7 +2160,7 @@ struct CompilerData {
     unsigned VariantIdx = 0;
     std::string SMName = instantiateTemplate(NTTPValues, TypeStrings, Idx, VariantIdx);
 
-    llvm::errs() << "JIT: searching for variant " << SMName << "...\n";
+    llvm::errs() << "JIT: searching for variant, Index: " << Idx << "; Name: " << SMName << " ...\n";
 
     // Now we know the name of the symbol, check to see if we already have it.
     if (auto SpecSymbol = CJ->findSymbol(SMName))
@@ -2369,7 +2369,7 @@ struct CompilerData {
     // names chosen for string literals in this module.
 
     for (auto &GV : Consumer->getModule()->global_values()) {
-      if (!IsLocalUnnamedConst(GV) && !GV.getName().startswith("__cuda_"))
+      if (!IsLocalUnnamedConst(GV) && !GV.getName().startswith("__cuda_") && !GV.getName().startswith(".omp_outlined."))
         continue;
 
       if (!RunningMod->getNamedValue(GV.getName()))
@@ -2507,7 +2507,9 @@ struct CompilerData {
       }
     }
 
+    auto AnonStructIds = Consumer->getCodeGenerator()->CGM().getCXXABI().getMangleContext().getAnonStructIds();
     Consumer->Initialize(*Ctx);
+    Consumer->getCodeGenerator()->CGM().getCXXABI().getMangleContext().setAnonStructIds(AnonStructIds);
 
     auto SpecSymbol = CJ->findSymbol(SMName);
     assert(SpecSymbol && "Can't find the specialization just generated?");
@@ -2653,17 +2655,16 @@ void *__clang_jit(const void *CmdArgs, unsigned CmdArgsLen,
     auto II =
       Instantiations.find_as(ThisInstInfo(InstKey, NTTPValues, NTTPValuesSize,
                                           TypeStrings, TypeStringsCnt));
-    if (II != Instantiations.end()) {
+    if (II != Instantiations.end())
       return II->second;
-    }
 
     if (OptimizationPasses.size() == 0)
       InitOptimizationPasses();
   }
 
-  llvm::errs() << "JIT: compiling new variant ...\n";
-
   llvm::MutexGuard Guard(Mutex);
+
+  llvm::errs() << "JIT: compiling new variant ...\n";
 
   if (!InitializedTarget) {
     llvm::InitializeNativeTarget();
