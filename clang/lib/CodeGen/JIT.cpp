@@ -105,10 +105,12 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/IPO/Internalize.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdlib> // ::getenv
 #include <cstring>
 #include <memory>
+#include <random>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -1084,18 +1086,36 @@ struct JITPass {
   JITPass(StringRef Name, JITPassType Type) : Name(Name), PassType(Type) {}
 };
 
-class JITPipeline {
-  std::vector<std::unique_ptr<JITPass>> Passes;
+using JITMultiPass = std::vector<std::unique_ptr<JITPass>>;
 
+class JITPipeline {
 public:
+  std::vector<std::unique_ptr<JITMultiPass>> Passes;
   JITPipeline() {};
 
+  void addMultiPass(const JITMultiPass& MP) {
+    auto NewMP = llvm::make_unique<JITMultiPass>();
+    for (const auto& JP : MP) {
+      NewMP->push_back(llvm::make_unique<JITPass>(JP->Name, JP->PassType));
+    }
+
+    Passes.push_back(std::move(NewMP));
+  }
+
   void addPass(const JITPass &JP) {
-    Passes.push_back(llvm::make_unique<JITPass>(JP.Name, JP.PassType));
+    auto NewMP = llvm::make_unique<JITMultiPass>();
+    NewMP->push_back(llvm::make_unique<JITPass>(JP.Name, JP.PassType));
+    Passes.push_back(std::move(NewMP));
   }
 
   void removePass(int Index) {
     Passes.erase(Passes.begin() + Index);
+  }
+
+  void shuffle(int VariantIdx) {
+    auto RNG = std::default_random_engine {};
+    RNG.seed(VariantIdx);
+    std::shuffle(std::begin(Passes), std::end(Passes), RNG);
   }
 
   void buildPassPipeline(PassBuilder::OptimizationLevel Level) {
@@ -1151,8 +1171,12 @@ public:
     addPass({"simplify-cfg", FunctionPass});
 
     addPass({"reassociate", FunctionPass});
-    addPass({"require<opt-remark-emit>", FunctionPass});
-    addPass({"loop-instsimplify", LoopPass});
+
+    JITMultiPass MP1;
+    MP1.push_back(llvm::make_unique<JITPass>("require<opt-remark-emit>", FunctionPass));
+    MP1.push_back(llvm::make_unique<JITPass>("loop-instsimplify", LoopPass));
+    addMultiPass(MP1);
+
     addPass({"simplify-cfg", LoopPass});
     addPass({"rotate", LoopPass});
     addPass({"unswitch", LoopPass});
@@ -1177,7 +1201,11 @@ public:
     addPass({"jump-threading", FunctionPass});
     addPass({"correlated-propagation", FunctionPass});
     addPass({"dse", FunctionPass});
-    addPass({"licm", LoopPass});
+
+    JITMultiPass MP2;
+    MP2.push_back(llvm::make_unique<JITPass>("require<opt-remark-emit>", FunctionPass));
+    MP2.push_back(llvm::make_unique<JITPass>("licm", LoopPass));
+    addMultiPass(MP2);
 
     addPass({"adce", FunctionPass});
     addPass({"simplify-cfg", FunctionPass});
@@ -1193,7 +1221,7 @@ public:
 
     // TODO: partial inlining?
 
-    addPass({"elim-avail-extern", ModulePass});
+    addPass({"elim-avail-extern", ModulePass}); // Removing this causes an error
     addPass({"rpo-functionattrs", ModulePass});
     addPass({"require<globals-aa>", ModulePass});
 
@@ -1207,16 +1235,21 @@ public:
     addPass({"slp-vectorizer", FunctionPass});
     addPass({"instcombine", FunctionPass});
 
-    addPass({"require<opt-remark-emit>", FunctionPass});
-    addPass({"licm", LoopPass});
+    JITMultiPass MP3;
+    MP3.push_back(llvm::make_unique<JITPass>("require<opt-remark-emit>", FunctionPass));
+    MP3.push_back(llvm::make_unique<JITPass>("licm", LoopPass));
+    addMultiPass(MP3);
 
     // TODO: enableUnrollAndJam?
 
     addPass({"unroll", FunctionPass}); // TODO: need to pass args here
     addPass({"transform-warning", FunctionPass});
     addPass({"instcombine", FunctionPass});
-    addPass({"require<opt-remark-emit>", FunctionPass});
-    addPass({"licm", LoopPass});
+
+    JITMultiPass MP4;
+    MP4.push_back(llvm::make_unique<JITPass>("require<opt-remark-emit>", FunctionPass));
+    MP4.push_back(llvm::make_unique<JITPass>("licm", LoopPass));
+    addMultiPass(MP4);
 
     addPass({"alignment-from-assumptions", FunctionPass});
     addPass({"loop-sink", FunctionPass});
@@ -1245,16 +1278,41 @@ public:
       return "loop";
   }
 
+  // Convert vector of MultiPasses to Passes
+  std::vector<std::unique_ptr<JITPass>> flattenPipeline() {
+    size_t total_size = 0;
+    for (auto const& MP: Passes){
+      total_size += MP->size();
+    }
+
+    std::vector<std::unique_ptr<JITPass>> Pipeline;
+    Pipeline.reserve(total_size);
+
+    for (auto& MP: Passes){
+        std::move(MP->begin(), MP->end(), std::back_inserter(Pipeline));
+    }
+
+    return Pipeline;
+  }
+
   std::string toString() {
+    auto FlattenedPasses = flattenPipeline();
+
     JITPassType CurrentType = ModulePass;
     std::string Pipeline = "module(";
 
     bool PassesOpen[4] = {true, false, false, false};
 
-    int index = 0;
-    for (const auto& Pass : Passes) {
+    size_t index = 0;
+    for (const auto& Pass : FlattenedPasses) {
       if (Pass->PassType != CurrentType) {
         if (Pass->PassType > CurrentType) {
+          // No Module to Loop pass adaptor, so we add "function" manually
+          if (Pass->PassType == LoopPass && PassesOpen[ModulePass] && !PassesOpen[CGSCCPass] && !PassesOpen[FunctionPass]) {
+            Pipeline += "function(";
+            PassesOpen[FunctionPass] = true;
+          }
+
           Pipeline += getPassTypeString(Pass->PassType) + "(";
           PassesOpen[Pass->PassType] = true;
         }
@@ -1277,13 +1335,18 @@ public:
           }
 
           Pipeline += ',';
+
+          if (!PassesOpen[Pass->PassType]) {
+            Pipeline += getPassTypeString(Pass->PassType) + "(";
+            PassesOpen[Pass->PassType] = true;
+          }
         }
       }
 
       CurrentType = Pass->PassType;
       Pipeline += Pass->Name.str();
 
-      if (index == Passes.size() - 1) {
+      if (index == FlattenedPasses.size() - 1) {
         int Parens = Pass->PassType - ModulePass + 1;
         while (Parens > 0) {
           Pipeline += ")";
@@ -1684,27 +1747,18 @@ struct CompilerData {
   }
 
   std::string buildPassPipeline(int VariantIdx) {
-    std::string PassPipeline;
+    JITPipeline Pipeline;
 
-    if (VariantIdx == 4) {
-      JITPipeline Pipeline;
+    if (VariantIdx == 3)
       Pipeline.buildPassPipeline(PassBuilder::O1);
-      PassPipeline = Pipeline.toString();
-    }
 
-    if (VariantIdx == 5) {
-      JITPipeline Pipeline;
+    if (VariantIdx == 4)
       Pipeline.buildPassPipeline(PassBuilder::O2);
-      PassPipeline = Pipeline.toString();
-    }
 
-    if (VariantIdx == 6) {
-      JITPipeline Pipeline;
+    if (VariantIdx == 5)
       Pipeline.buildPassPipeline(PassBuilder::O3);
-      PassPipeline = Pipeline.toString();
-    }
 
-    return PassPipeline;
+    return Pipeline.toString();
   }
 
   void restoreFuncDeclContext(FunctionDecl *FunD) {
@@ -2191,8 +2245,8 @@ struct CompilerData {
     // This is needed to pass the correct argument to the inlining pass
     Invocation->getCodeGenOpts().OptimizationLevel = 1;
 
-    if (VariantIdx < 4)
-      Invocation->getCodeGenOpts().OptimizationLevel = VariantIdx;
+    if (VariantIdx < 3)
+      Invocation->getCodeGenOpts().OptimizationLevel = VariantIdx + 1;
     else
       PassPipeline = buildPassPipeline(VariantIdx);
 
@@ -2487,11 +2541,14 @@ struct CompilerData {
                             Linker::Flags::OverrideFromSrc))
       fatal();
 
+
     StringRef StatsFile = Invocation->getFrontendOpts().StatsFile;
     if (!StatsFile.empty()) {
       std::string VariantStatsFile = llvm::Twine(StatsFile)
                                     .concat(llvm::Twine('.'))
                                     .concat(llvm::Twine(FuncMap[Idx]->getName()))
+                                    .concat(llvm::Twine('_'))
+                                    .concat(llvm::Twine(Idx))
                                     .concat(llvm::Twine('.'))
                                     .concat(llvm::Twine(VariantIdx))
                                     .str();
