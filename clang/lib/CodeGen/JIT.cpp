@@ -563,6 +563,13 @@ public:
     Gen->HandleVTable(RD);
   }
 
+  llvm::Error ReemitOptimized(llvm::Module *M, StringRef PassPipeline) {
+    return EmitBackendOutput(Diags, HeaderSearchOpts, CodeGenOpts, TargetOpts,
+                             LangOpts, Context->getTargetInfo().getDataLayout(),
+                             M, Action, llvm::make_unique<llvm::buffer_ostream>(*AsmOutStream),
+                             PassPipeline);
+  }
+
   void EmitOptimized(StringRef PassPipeline) {
     // Copied from HandleTranslationUnit in CodeGenAction.cpp
 
@@ -1288,7 +1295,7 @@ public:
     std::vector<std::unique_ptr<JITPass>> Pipeline;
     Pipeline.reserve(total_size);
 
-    for (auto& MP: Passes){
+    for (auto& MP: Passes) {
         std::move(MP->begin(), MP->end(), std::back_inserter(Pipeline));
     }
 
@@ -1307,8 +1314,8 @@ public:
     for (const auto& Pass : FlattenedPasses) {
       if (Pass->PassType != CurrentType) {
         if (Pass->PassType > CurrentType) {
-          // No Module to Loop pass adaptor, so we add "function" manually
-          if (Pass->PassType == LoopPass && PassesOpen[ModulePass] && !PassesOpen[CGSCCPass] && !PassesOpen[FunctionPass]) {
+          // No Module/CGSCC to Loop pass adaptor, so we add "function" manually
+          if (Pass->PassType == LoopPass && (PassesOpen[ModulePass] || PassesOpen[CGSCCPass]) && !PassesOpen[FunctionPass]) {
             Pipeline += "function(";
             PassesOpen[FunctionPass] = true;
           }
@@ -1347,7 +1354,14 @@ public:
       Pipeline += Pass->Name.str();
 
       if (index == FlattenedPasses.size() - 1) {
-        int Parens = Pass->PassType - ModulePass + 1;
+        int Parens = 0;
+        for (const char c: Pipeline) {
+          if (c == '(')
+            Parens++;
+          else if (c == ')')
+            Parens--;
+        }
+
         while (Parens > 0) {
           Pipeline += ")";
           Parens--;
@@ -1360,6 +1374,241 @@ public:
     }
 
     return Pipeline;
+  }
+};
+
+class GeneticPipelineBuilder {
+public:
+  GeneticPipelineBuilder(
+      std::shared_ptr<BackendConsumer> &Consumer, size_t PopulationSize,
+      std::vector<std::unique_ptr<JITMultiPass>> &&PassMap)
+    : Consumer(Consumer), PopulationSize(PopulationSize), ChromosomeSize(PassMap.size()),
+      GenePoolSize(PassMap.size()), Chromosomes(PopulationSize, std::vector<int>(ChromosomeSize)),
+      NewChromosomes(PopulationSize, std::vector<int>(ChromosomeSize)),
+      Probabilities(PopulationSize, 0.0), CumulativeProbabilities(PopulationSize, 0.0),
+      Fitness(PopulationSize, 0.0), PreviousFitness(PopulationSize, 0.0),
+      Mod(llvm::CloneModule(*Consumer->getModule())), PassMap(std::move(PassMap)), O3Instructions(0) {
+        JITPipeline JP;
+        JP.buildPassPipeline(PassBuilder::OptimizationLevel::O3);
+        std::unique_ptr<llvm::Module> M = llvm::CloneModule(*Mod);
+        Consumer->ReemitOptimized(M.get(), JP.toString());
+        O3Instructions = M->getInstructionCount();
+      }
+
+  std::string Run() {
+    // taken mostly from https://arxiv.org/pdf/1308.4675.pdf,
+    // and partly from https://www.whitman.edu/Documents/Academics/Mathematics/2014/carrjk.pdf
+    // and https://towardsdatascience.com/genetic-algorithm-explained-step-by-step-65358abe2bf
+
+    buildInitialPopulation();
+    evaluateFitness();
+
+    llvm::errs() << "Start ********\n";
+    printStats();
+    llvm::errs() << "**************\n";
+
+    int i = 0;
+    for (i = 0; i < 100; i++) {
+      evaluateFitness();
+      computeProbabilities();
+      selectNewChromosomes();
+      mateChromosomes();
+      mutateGenes();
+      if (i == 0 || i == 49 || i == 99) {
+        llvm::errs() << "Index " << i << " ********\n";
+        printStats();
+        llvm::errs() << "*****************\n";
+        PreviousFitness = Fitness;
+      }
+    }
+
+    llvm::errs() << "O3 num instructions: " << O3Instructions << '\n';
+    auto min = std::max_element(std::begin(Fitness), std::end(Fitness));
+    llvm::errs() << "Num instrs " << (unsigned) (1 / Fitness[min - Fitness.begin()]) << '\n';
+    return buildPipeline(Chromosomes[min - Fitness.begin()]);
+  }
+
+private:
+  std::shared_ptr<BackendConsumer> Consumer;
+  size_t PopulationSize;
+  size_t ChromosomeSize;
+  size_t GenePoolSize;
+  std::vector<std::vector<int>> Chromosomes;
+  std::vector<std::vector<int>> NewChromosomes;
+  std::vector<double> Probabilities;
+  std::vector<double> CumulativeProbabilities;
+  std::vector<double> Fitness;
+  std::vector<double> PreviousFitness; // Needed for stats
+  std::unique_ptr<llvm::Module> Mod;
+  std::vector<std::unique_ptr<JITMultiPass>> PassMap; // Maps an integer to a Pass
+  unsigned O3Instructions;
+
+  static constexpr double MutationRate = 0.01;
+
+  void buildInitialPopulation() {
+    std::random_device RandomDevice;
+    std::mt19937 Engine{RandomDevice()};
+    std::uniform_int_distribution<int> Distribution{0, static_cast<int>(GenePoolSize) - 1};
+
+    auto Gen = [&Distribution, &Engine](){ return Distribution(Engine); };
+
+    for (auto &C : Chromosomes)
+      std::generate(std::begin(C), std::end(C), Gen);
+  }
+
+  void printChromosomes(bool PrintNew=false) {
+    size_t i = 0;
+
+    for (const auto &C: Chromosomes) {
+      llvm::errs() << i << ": ";
+      for (const auto Gene: C)
+        llvm::errs() << Gene;
+
+      llvm::errs() << "; P[" << i << "] = " << Probabilities[i] << '\n';
+      i++;
+    }
+
+    if (PrintNew) {
+      size_t i = 0;
+
+      for (const auto &C: NewChromosomes) {
+        llvm::errs() << i << ": ";
+        for (const auto Gene: C)
+          llvm::errs() << Gene;
+
+        llvm::errs() << '\n';
+        i++;
+      }
+    }
+  }
+
+  void printStats() {
+    double TotalFitness = 0;
+    for (size_t i = 0; i < PopulationSize; i++)
+      TotalFitness += Fitness[i];
+
+    llvm::errs() << "Average " << (unsigned) (PopulationSize / TotalFitness) << '\n';
+
+    auto max = std::max_element(std::begin(Fitness), std::end(Fitness));
+    auto min = std::min_element(std::begin(Fitness), std::end(Fitness));
+    llvm::errs() << "Min instructions " << (unsigned) (1 / *max) << '\n';
+    llvm::errs() << "Max instructions " << (unsigned) (1 / *min) << '\n';
+
+    unsigned NumImproved = 0;
+    unsigned NumWorsened = 0;
+    unsigned NumSame = 0;
+    unsigned NumFailed = 0;
+    for (size_t i = 0; i < PopulationSize; i++) {
+      if (Fitness[i] == 0)
+        NumFailed++;
+      else if (Fitness[i] > PreviousFitness[i])
+        NumImproved++;
+      else if (Fitness[i] < PreviousFitness[i])
+        NumWorsened++;
+      else if (Fitness[i] == PreviousFitness[i])
+        NumSame++;
+    }
+
+    llvm::errs() << "Improved: " << NumImproved << "; Worsened: " << NumWorsened
+                 << "; Same: " << NumSame << "; Failed: " << NumFailed << '\n';
+  }
+
+  void computeProbabilities() {
+    double TotalFitness = 0;
+    for (size_t i = 0; i < PopulationSize; i++)
+      TotalFitness += Fitness[i];
+
+    for (size_t i = 0; i < PopulationSize; i++) {
+      Probabilities[i] = Fitness[i] / (double) TotalFitness;
+
+      if (i == 0)
+        CumulativeProbabilities[i] = Probabilities[i];
+      else
+        CumulativeProbabilities[i] = CumulativeProbabilities[i - 1] + Probabilities[i];
+    }
+  }
+
+  std::string buildPipeline(const std::vector<int> &Chromosome) {
+    JITPipeline JP;
+
+    for (int Gene: Chromosome)
+      JP.addMultiPass(*PassMap[Gene]);
+
+    return JP.toString();
+  }
+
+  void evaluateFitness() {
+    int index = 0;
+    for (auto &C: Chromosomes) {
+      std::unique_ptr<llvm::Module> M = llvm::CloneModule(*Mod);
+
+      double F;
+      if (auto Err = Consumer->ReemitOptimized(M.get(), buildPipeline(C)))
+        F = 0;
+      else
+        F = 1.0 / M->getInstructionCount();
+
+      llvm::ResetStatistics();
+      Fitness[index] = F;
+      index++;
+    }
+  }
+
+  void selectNewChromosomes() {
+    std::vector<double> Random(PopulationSize);
+
+    std::random_device RandomDevice;
+    std::mt19937 Engine{RandomDevice()};
+    std::uniform_real_distribution<double> Distribution{0, 1};
+
+    auto Gen = [&Distribution, &Engine](){ return Distribution(Engine); };
+
+    std::generate(std::begin(Random), std::end(Random), Gen);
+
+    for (size_t i = 0; i < PopulationSize; i++) {
+      for (size_t j = 0; j < PopulationSize; j++) {
+        NewChromosomes[i] = Chromosomes[j];
+        if (Random[i] < CumulativeProbabilities[j]) {
+          break;
+        }
+      }
+    }
+  }
+
+  void mateChromosomes() {
+    std::random_device RandomDevice;
+    std::mt19937 Engine{RandomDevice()};
+    std::uniform_int_distribution<int> Distribution{1, static_cast<int>(ChromosomeSize) - 2}; // Select the index for the crossover point
+
+    for (size_t i = 0; i < PopulationSize / 2; i++) {
+      auto &C1 = NewChromosomes[i];
+      auto &C2 = NewChromosomes[i + 1];
+
+      int index = Distribution(Engine);
+
+      for (int j = 0; j < index; j++) {
+        Chromosomes[i][j] = C1[j];
+        Chromosomes[i + 1][j] = C2[j];
+      }
+
+      for (size_t j = index; j < ChromosomeSize; j++) {
+        Chromosomes[i][j] = C2[j];
+        Chromosomes[i + 1][j] = C1[j];
+      }
+    }
+  }
+
+  void mutateGenes() {
+    std::random_device RandomDevice;
+    std::mt19937 Engine{RandomDevice()};
+    std::uniform_int_distribution<unsigned> GeneIndexDistribution{0, static_cast<unsigned>(PopulationSize * ChromosomeSize) - 1};
+    std::uniform_int_distribution<unsigned> GenePoolDistribution{0, static_cast<unsigned>(GenePoolSize) - 1};
+
+    int NumMutations = MutationRate * PopulationSize * ChromosomeSize;
+    for (int i = 0; i < NumMutations; i++) {
+      int GeneIndex = GeneIndexDistribution(Engine);
+      Chromosomes[GeneIndex / ChromosomeSize][GeneIndex % ChromosomeSize] = GenePoolDistribution(Engine);
+    }
   }
 };
 
@@ -1428,7 +1677,7 @@ struct CompilerData {
   std::shared_ptr<HeaderSearchOptions>    HSOpts;
   std::shared_ptr<PreprocessorOptions>    PPOpts;
   IntrusiveRefCntPtr<ASTReader>           Reader;
-  std::unique_ptr<BackendConsumer>        Consumer;
+  std::shared_ptr<BackendConsumer>        Consumer;
   std::unique_ptr<Sema>                   S;
   TrivialModuleLoader                     ModuleLoader;
   std::unique_ptr<llvm::Module>           RunningMod;
@@ -2245,10 +2494,19 @@ struct CompilerData {
     // This is needed to pass the correct argument to the inlining pass
     Invocation->getCodeGenOpts().OptimizationLevel = 1;
 
-    if (VariantIdx < 3)
-      Invocation->getCodeGenOpts().OptimizationLevel = VariantIdx + 1;
-    else
-      PassPipeline = buildPassPipeline(VariantIdx);
+    if (VariantIdx == 0)
+      Invocation->getCodeGenOpts().OptimizationLevel = 3;
+    else {
+      JITPipeline JP;
+      JP.buildPassPipeline(PassBuilder::OptimizationLevel::O3);
+      GeneticPipelineBuilder GPB(Consumer, 25, std::move(JP.Passes));
+      GPB.Run();
+    }
+
+    // if (VariantIdx < 3)
+    //   Invocation->getCodeGenOpts().OptimizationLevel = VariantIdx + 1;
+    // else
+    //   PassPipeline = buildPassPipeline(VariantIdx);
 
     // Finalize the module, generate module-level metadata, etc.
 
