@@ -168,87 +168,103 @@ STATISTIC(LoopsAnalyzed, "Number of loops analyzed for vectorization");
 
 /// Loops with a known constant trip count below this number are vectorized only
 /// if no scalar iteration overheads are incurred.
-static cl::opt<unsigned> TinyTripCountVectorThreshold(
-    "vectorizer-min-trip-count", cl::init(16), cl::Hidden,
+static cl::opt<unsigned, true> TinyTripCountVectorThreshold(
+    "vectorizer-min-trip-count", cl::location(TinyTripCountVectorThresholdVal),
+    cl::init(16), cl::Hidden,
     cl::desc("Loops with a constant trip count that is smaller than this "
              "value are vectorized only if no scalar iteration overheads "
              "are incurred."));
 
-static cl::opt<bool> MaximizeBandwidth(
-    "vectorizer-maximize-bandwidth", cl::init(false), cl::Hidden,
+static cl::opt<bool, true> MaximizeBandwidth(
+    "vectorizer-maximize-bandwidth", cl::location(MaximizeBandwidthVal),
+    cl::init(false), cl::Hidden,
     cl::desc("Maximize bandwidth when selecting vectorization factor which "
              "will be determined by the smallest type in loop."));
 
-static cl::opt<bool> EnableInterleavedMemAccesses(
-    "enable-interleaved-mem-accesses", cl::init(false), cl::Hidden,
+static cl::opt<bool, true> EnableInterleavedMemAccesses(
+    "enable-interleaved-mem-accesses", cl::location(EnableInterleavedMemAccessesVal),
+    cl::init(false), cl::Hidden,
     cl::desc("Enable vectorization on interleaved memory accesses in a loop"));
 
 /// An interleave-group may need masking if it resides in a block that needs
 /// predication, or in order to mask away gaps. 
-static cl::opt<bool> EnableMaskedInterleavedMemAccesses(
-    "enable-masked-interleaved-mem-accesses", cl::init(false), cl::Hidden,
+static cl::opt<bool, true> EnableMaskedInterleavedMemAccesses(
+    "enable-masked-interleaved-mem-accesses", cl::location(EnableMaskedInterleavedMemAccessesVal),
+    cl::init(false), cl::Hidden,
     cl::desc("Enable vectorization on masked interleaved memory accesses in a loop"));
 
 /// We don't interleave loops with a known constant trip count below this
 /// number.
 static const unsigned TinyTripCountInterleaveThreshold = 128;
 
-static cl::opt<unsigned> ForceTargetNumScalarRegs(
-    "force-target-num-scalar-regs", cl::init(0), cl::Hidden,
+static cl::opt<unsigned, true> ForceTargetNumScalarRegs(
+    "force-target-num-scalar-regs", cl::location(ForceTargetNumScalarRegsVal),
+    cl::init(0), cl::Hidden,
     cl::desc("A flag that overrides the target's number of scalar registers."));
 
-static cl::opt<unsigned> ForceTargetNumVectorRegs(
-    "force-target-num-vector-regs", cl::init(0), cl::Hidden,
+static cl::opt<unsigned, true> ForceTargetNumVectorRegs(
+    "force-target-num-vector-regs", cl::location(ForceTargetNumVectorRegsVal),
+    cl::init(0), cl::Hidden,
     cl::desc("A flag that overrides the target's number of vector registers."));
 
-static cl::opt<unsigned> ForceTargetMaxScalarInterleaveFactor(
-    "force-target-max-scalar-interleave", cl::init(0), cl::Hidden,
+static cl::opt<unsigned, true> ForceTargetMaxScalarInterleaveFactor(
+    "force-target-max-scalar-interleave", cl::location(ForceTargetMaxScalarInterleaveFactorVal),
+    cl::init(0), cl::Hidden,
     cl::desc("A flag that overrides the target's max interleave factor for "
              "scalar loops."));
 
-static cl::opt<unsigned> ForceTargetMaxVectorInterleaveFactor(
-    "force-target-max-vector-interleave", cl::init(0), cl::Hidden,
+static cl::opt<unsigned, true> ForceTargetMaxVectorInterleaveFactor(
+    "force-target-max-vector-interleave", cl::location(ForceTargetMaxVectorInterleaveFactorVal),
+    cl::init(0), cl::Hidden,
     cl::desc("A flag that overrides the target's max interleave factor for "
              "vectorized loops."));
 
-static cl::opt<unsigned> ForceTargetInstructionCost(
-    "force-target-instruction-cost", cl::init(0), cl::Hidden,
+static cl::opt<unsigned, true> ForceTargetInstructionCost(
+    "force-target-instruction-cost", cl::location(ForceTargetInstructionCostVal),
+    cl::init(0), cl::Hidden,
     cl::desc("A flag that overrides the target's expected cost for "
              "an instruction to a single constant value. Mostly "
              "useful for getting consistent testing."));
 
-static cl::opt<unsigned> SmallLoopCost(
-    "small-loop-cost", cl::init(20), cl::Hidden,
+static cl::opt<unsigned, true> SmallLoopCost(
+    "small-loop-cost", cl::location(SmallLoopCostVal),
+    cl::init(20), cl::Hidden,
     cl::desc(
         "The cost of a loop that is considered 'small' by the interleaver."));
 
-static cl::opt<bool> LoopVectorizeWithBlockFrequency(
-    "loop-vectorize-with-block-frequency", cl::init(true), cl::Hidden,
+static cl::opt<bool, true> LoopVectorizeWithBlockFrequency(
+    "loop-vectorize-with-block-frequency", cl::location(LoopVectorizeWithBlockFrequencyVal),
+    cl::init(true), cl::Hidden,
     cl::desc("Enable the use of the block frequency analysis to access PGO "
              "heuristics minimizing code growth in cold regions and being more "
              "aggressive in hot regions."));
 
 // Runtime interleave loops for load/store throughput.
-static cl::opt<bool> EnableLoadStoreRuntimeInterleave(
-    "enable-loadstore-runtime-interleave", cl::init(true), cl::Hidden,
+static cl::opt<bool, true> EnableLoadStoreRuntimeInterleave(
+    "enable-loadstore-runtime-interleave", cl::location(EnableLoadStoreRuntimeInterleaveVal),
+    cl::init(true), cl::Hidden,
     cl::desc(
         "Enable runtime interleaving until load/store ports are saturated"));
 
 /// The number of stores in a loop that are allowed to need predication.
-static cl::opt<unsigned> NumberOfStoresToPredicate(
-    "vectorize-num-stores-pred", cl::init(1), cl::Hidden,
+static cl::opt<unsigned, true> NumberOfStoresToPredicate(
+    "vectorize-num-stores-pred", cl::location(NumberOfStoresToPredicateVal),
+    cl::init(1), cl::Hidden,
     cl::desc("Max number of stores to be predicated behind an if."));
 
-static cl::opt<bool> EnableIndVarRegisterHeur(
-    "enable-ind-var-reg-heur", cl::init(true), cl::Hidden,
+static cl::opt<bool, true> EnableIndVarRegisterHeur(
+    "enable-ind-var-reg-heur", cl::location(EnableIndVarRegisterHeurVal),
+    cl::init(true), cl::Hidden,
     cl::desc("Count the induction variable only once when interleaving"));
 
-static cl::opt<bool> EnableCondStoresVectorization(
-    "enable-cond-stores-vec", cl::init(true), cl::Hidden,
+static cl::opt<bool, true> EnableCondStoresVectorization(
+    "enable-cond-stores-vec", cl::location(EnableCondStoresVectorizationVal),
+    cl::init(true), cl::Hidden,
     cl::desc("Enable if predication of stores during vectorization."));
 
-static cl::opt<unsigned> MaxNestedScalarReductionIC(
-    "max-nested-scalar-reduction-interleave", cl::init(2), cl::Hidden,
+static cl::opt<unsigned, true> MaxNestedScalarReductionIC(
+    "max-nested-scalar-reduction-interleave", cl::location(MaxNestedScalarReductionICVal),
+    cl::init(2), cl::Hidden,
     cl::desc("The maximum interleave count to use when interleaving a scalar "
              "reduction in a nested loop."));
 
@@ -268,8 +284,9 @@ cl::opt<bool> EnableVPlanPredication(
 // VPlan-native vectorization path. It must be used in conjuction with
 // -enable-vplan-native-path. -vplan-verify-hcfg can also be used to enable the
 // verification of the H-CFGs built.
-static cl::opt<bool> VPlanBuildStressTest(
-    "vplan-build-stress-test", cl::init(false), cl::Hidden,
+static cl::opt<bool, true> VPlanBuildStressTest(
+    "vplan-build-stress-test", cl::location(VPlanBuildStressTestVal),
+    cl::init(false), cl::Hidden,
     cl::desc(
         "Build VPlan for every supported loop nest in the function and bail "
         "out right after the build (stress test the VPlan H-CFG construction "

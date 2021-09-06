@@ -75,6 +75,25 @@ class ScalarEvolution;
 class TargetLibraryInfo;
 class TargetTransformInfo;
 
+// Make these values available externally
+unsigned TinyTripCountVectorThresholdVal;
+bool MaximizeBandwidthVal;
+bool EnableInterleavedMemAccessesVal;
+bool EnableMaskedInterleavedMemAccessesVal;
+unsigned ForceTargetNumScalarRegsVal;
+unsigned ForceTargetNumVectorRegsVal;
+unsigned ForceTargetMaxScalarInterleaveFactorVal;
+unsigned ForceTargetMaxVectorInterleaveFactorVal;
+unsigned ForceTargetInstructionCostVal;
+unsigned SmallLoopCostVal;
+bool LoopVectorizeWithBlockFrequencyVal;
+bool EnableLoadStoreRuntimeInterleaveVal;
+unsigned NumberOfStoresToPredicateVal;
+bool EnableIndVarRegisterHeurVal;
+bool EnableCondStoresVectorizationVal;
+unsigned MaxNestedScalarReductionICVal;
+bool VPlanBuildStressTestVal;
+
 /// The LoopVectorize Pass.
 struct LoopVectorizePass : public PassInfoMixin<LoopVectorizePass> {
   /// If false, consider all loops for interleaving.
