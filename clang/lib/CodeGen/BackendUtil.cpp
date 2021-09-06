@@ -146,7 +146,7 @@ public:
   void EmitAssembly(BackendAction Action,
                     std::unique_ptr<raw_pwrite_stream> OS);
 
-  void EmitAssemblyWithNewPassManager(BackendAction Action,
+  Error EmitAssemblyWithNewPassManager(BackendAction Action,
                                       std::unique_ptr<raw_pwrite_stream> OS,
                                       StringRef PassPipeline);
 
@@ -1249,7 +1249,7 @@ void addSanitizersAtO0(ModulePassManager &MPM, const Triple &TargetTriple,
 ///
 /// This API is planned to have its functionality finished and then to replace
 /// `EmitAssembly` at some point in the future when the default switches.
-void EmitAssemblyHelper::EmitAssemblyWithNewPassManager(
+Error EmitAssemblyHelper::EmitAssemblyWithNewPassManager(
     BackendAction Action, std::unique_ptr<raw_pwrite_stream> OS, StringRef PassPipeline) {
   TimeRegion Region(FrontendTimesIsEnabled ? &CodeGenerationTime : nullptr);
   setCommandLineOpts(CodeGenOpts);
@@ -1259,7 +1259,7 @@ void EmitAssemblyHelper::EmitAssemblyWithNewPassManager(
   CreateTargetMachine(/*MustCreateTM*/ true);
   if (!TM)
     // This will already be diagnosed, just bail.
-    return;
+    return make_error<StringError>("", inconvertibleErrorCode());
   TheModule->setDataLayout(TM->createDataLayout());
 
   Optional<PGOOptions> PGOOpt;
@@ -1328,6 +1328,7 @@ void EmitAssemblyHelper::EmitAssemblyWithNewPassManager(
     if (auto Err = PB.parsePassPipeline(MPM, PassPipeline, /*VerifyEachPass=*/false)) {
       llvm::errs() << "JIT: Could not parse MPM pipeline " << PassPipeline
                    << ". Reason: " << Err << '\n';
+      return make_error<StringError>("JIT: Could not parse MPM pipeline", inconvertibleErrorCode());
     }
   } else if (!CodeGenOpts.DisableLLVMPasses) {
     bool IsThinLTO = CodeGenOpts.PrepareForThinLTO;
@@ -1437,7 +1438,7 @@ void EmitAssemblyHelper::EmitAssemblyWithNewPassManager(
       if (!CodeGenOpts.ThinLinkBitcodeFile.empty()) {
         ThinLinkOS = openOutputFile(CodeGenOpts.ThinLinkBitcodeFile);
         if (!ThinLinkOS)
-          return;
+          return Error::success();
       }
       TheModule->addModuleFlag(Module::Error, "EnableSplitLTOUnit",
                                CodeGenOpts.EnableSplitLTOUnit);
@@ -1475,12 +1476,12 @@ void EmitAssemblyHelper::EmitAssemblyWithNewPassManager(
     if (!CodeGenOpts.SplitDwarfFile.empty()) {
       DwoOS = openOutputFile(CodeGenOpts.SplitDwarfFile);
       if (!DwoOS)
-        return;
+        return Error::success();
     }
     if (!AddEmitPasses(CodeGenPasses, Action, *OS,
                        DwoOS ? &DwoOS->os() : nullptr))
       // FIXME: Should we handle this error differently?
-      return;
+      return make_error<StringError>("", inconvertibleErrorCode());
     break;
   }
 
@@ -1505,6 +1506,8 @@ void EmitAssemblyHelper::EmitAssemblyWithNewPassManager(
     ThinLinkOS->keep();
   if (DwoOS)
     DwoOS->keep();
+
+  return Error::success();
 }
 
 Expected<BitcodeModule> clang::FindThinLTOModule(MemoryBufferRef MBRef) {
@@ -1646,7 +1649,7 @@ static void runThinLTOBackend(ModuleSummaryIndex *CombinedIndex, Module *M,
   }
 }
 
-void clang::EmitBackendOutput(DiagnosticsEngine &Diags,
+Error clang::EmitBackendOutput(DiagnosticsEngine &Diags,
                               const HeaderSearchOptions &HeaderOpts,
                               const CodeGenOptions &CGOpts,
                               const clang::TargetOptions &TOpts,
@@ -1667,7 +1670,7 @@ void clang::EmitBackendOutput(DiagnosticsEngine &Diags,
       logAllUnhandledErrors(IndexOrErr.takeError(), errs(),
                             "Error loading index file '" +
                             CGOpts.ThinLTOIndexFile + "': ");
-      return;
+      return make_error<StringError>("", inconvertibleErrorCode());
     }
     std::unique_ptr<ModuleSummaryIndex> CombinedIndex = std::move(*IndexOrErr);
     // A null CombinedIndex means we should skip ThinLTO compilation
@@ -1678,14 +1681,14 @@ void clang::EmitBackendOutput(DiagnosticsEngine &Diags,
         runThinLTOBackend(CombinedIndex.get(), M, HeaderOpts, CGOpts, TOpts,
                           LOpts, std::move(OS), CGOpts.SampleProfileFile,
                           CGOpts.ProfileRemappingFile, Action);
-        return;
+        return make_error<StringError>("", inconvertibleErrorCode());
       }
       // Distributed indexing detected that nothing from the module is needed
       // for the final linking. So we can skip the compilation. We sill need to
       // output an empty object file to make sure that a linker does not fail
       // trying to read it. Also for some features, like CFI, we must skip
       // the compilation as CombinedIndex does not contain all required
-      // information.
+      // inf  ormation.
       EmptyModule = llvm::make_unique<llvm::Module>("empty", M->getContext());
       EmptyModule->setTargetTriple(M->getTargetTriple());
       M = EmptyModule.get();
@@ -1694,8 +1697,9 @@ void clang::EmitBackendOutput(DiagnosticsEngine &Diags,
 
   EmitAssemblyHelper AsmHelper(Diags, HeaderOpts, CGOpts, TOpts, LOpts, M);
 
+  Error Err = Error::success();
   if (CGOpts.ExperimentalNewPassManager)
-    AsmHelper.EmitAssemblyWithNewPassManager(Action, std::move(OS), PassPipeline);
+    Err = AsmHelper.EmitAssemblyWithNewPassManager(Action, std::move(OS), PassPipeline);
   else
     AsmHelper.EmitAssembly(Action, std::move(OS));
 
@@ -1710,6 +1714,8 @@ void clang::EmitBackendOutput(DiagnosticsEngine &Diags,
       Diags.Report(DiagID) << DLDesc << TDesc.getStringRepresentation();
     }
   }
+
+  return Err;
 }
 
 static const char* getSectionNameForBitcode(const Triple &T) {
