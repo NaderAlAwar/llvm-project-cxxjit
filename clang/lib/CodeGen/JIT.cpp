@@ -56,6 +56,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/CodeGen/MachineOptimizationRemarkEmitter.h"
 #include "llvm/ExecutionEngine/ExecutionEngine.h"
 #include "llvm/ExecutionEngine/JITSymbol.h"
@@ -1381,18 +1382,29 @@ class GeneticPipelineBuilder {
 public:
   GeneticPipelineBuilder(
       std::shared_ptr<BackendConsumer> &Consumer, size_t PopulationSize,
-      std::vector<std::unique_ptr<JITMultiPass>> &&PassMap)
-    : Consumer(Consumer), PopulationSize(PopulationSize), ChromosomeSize(PassMap.size()),
-      GenePoolSize(PassMap.size()), Chromosomes(PopulationSize, std::vector<int>(ChromosomeSize)),
+      size_t ChromosomeSize, size_t GenePoolSize, std::vector<std::unique_ptr<JITMultiPass>> &&PassMap)
+    : Consumer(Consumer), PopulationSize(PopulationSize), ChromosomeSize(ChromosomeSize),
+      GenePoolSize(GenePoolSize), Chromosomes(PopulationSize, std::vector<int>(ChromosomeSize)),
       NewChromosomes(PopulationSize, std::vector<int>(ChromosomeSize)),
       Probabilities(PopulationSize, 0.0), CumulativeProbabilities(PopulationSize, 0.0),
       Fitness(PopulationSize, 0.0), PreviousFitness(PopulationSize, 0.0),
-      Mod(llvm::CloneModule(*Consumer->getModule())), PassMap(std::move(PassMap)), O3Instructions(0) {
+      Mod(llvm::CloneModule(*Consumer->getModule())), PassMap(std::move(PassMap)), O3Instructions(0),
+      O3LoopsVectorized(0) {
         JITPipeline JP;
         JP.buildPassPipeline(PassBuilder::OptimizationLevel::O3);
         std::unique_ptr<llvm::Module> M = llvm::CloneModule(*Mod);
         Consumer->ReemitOptimized(M.get(), JP.toString());
         O3Instructions = M->getInstructionCount();
+
+        auto Stats = llvm::GetStatistics();
+        auto VectorizeStat = std::find_if(Stats.begin(), Stats.end(),
+                                          [](const std::pair<StringRef, unsigned>& S) {
+                                          return std::get<0>(S) == "LoopsVectorized"; } );
+
+        if (VectorizeStat != Stats.end())
+          O3LoopsVectorized = std::get<1>(*VectorizeStat);
+        else
+          O3LoopsVectorized = 0;
       }
 
   std::string Run() {
@@ -1417,6 +1429,7 @@ public:
       if (i == 0 || i == 49 || i == 99) {
         llvm::errs() << "Index " << i << " ********\n";
         printStats();
+        // printChromosomes();
         llvm::errs() << "*****************\n";
         PreviousFitness = Fitness;
       }
@@ -1425,6 +1438,11 @@ public:
     llvm::errs() << "O3 num instructions: " << O3Instructions << '\n';
     auto min = std::max_element(std::begin(Fitness), std::end(Fitness));
     llvm::errs() << "Num instrs " << (unsigned) (1 / Fitness[min - Fitness.begin()]) << '\n';
+
+    // llvm::errs() << "O3 Loops Vectorized: " << O3LoopsVectorized << '\n';
+    // auto min = std::max_element(std::begin(Fitness), std::end(Fitness));
+    // llvm::errs() << "Loops Vectorized " << (unsigned) (Fitness[min - Fitness.begin()]) << '\n';
+
     return buildPipeline(Chromosomes[min - Fitness.begin()]);
   }
 
@@ -1442,8 +1460,9 @@ private:
   std::unique_ptr<llvm::Module> Mod;
   std::vector<std::unique_ptr<JITMultiPass>> PassMap; // Maps an integer to a Pass
   unsigned O3Instructions;
+  unsigned O3LoopsVectorized;
 
-  static constexpr double MutationRate = 0.01;
+  static constexpr double MutationRate = 0.001;
 
   void buildInitialPopulation() {
     std::random_device RandomDevice;
@@ -1462,7 +1481,7 @@ private:
     for (const auto &C: Chromosomes) {
       llvm::errs() << i << ": ";
       for (const auto Gene: C)
-        llvm::errs() << Gene;
+        llvm::errs() << Gene << ", ";
 
       llvm::errs() << "; P[" << i << "] = " << Probabilities[i] << '\n';
       i++;
@@ -1493,6 +1512,13 @@ private:
     auto min = std::min_element(std::begin(Fitness), std::end(Fitness));
     llvm::errs() << "Min instructions " << (unsigned) (1 / *max) << '\n';
     llvm::errs() << "Max instructions " << (unsigned) (1 / *min) << '\n';
+
+    // llvm::errs() << "Average " << (unsigned) (TotalFitness / PopulationSize) << '\n';
+
+    // auto max = std::max_element(std::begin(Fitness), std::end(Fitness));
+    // auto min = std::min_element(std::begin(Fitness), std::end(Fitness));
+    // llvm::errs() << "Max Vectorized " << (unsigned) (*max) << '\n';
+    // llvm::errs() << "Min Vectorized " << (unsigned) (*min) << '\n';
 
     unsigned NumImproved = 0;
     unsigned NumWorsened = 0;
@@ -1539,19 +1565,56 @@ private:
 
   void evaluateFitness() {
     int index = 0;
-    for (auto &C: Chromosomes) {
-      std::unique_ptr<llvm::Module> M = llvm::CloneModule(*Mod);
-
-      double F;
-      if (auto Err = Consumer->ReemitOptimized(M.get(), buildPipeline(C)))
-        F = 0;
-      else
-        F = 1.0 / M->getInstructionCount();
-
-      llvm::ResetStatistics();
-      Fitness[index] = F;
+    for (const auto &C: Chromosomes) {
+      Fitness[index] = calculateChromosomeFitness(C);
       index++;
     }
+  }
+
+  double calculateChromosomeFitness(const std::vector<int>& C) {
+    std::unique_ptr<llvm::Module> M = llvm::CloneModule(*Mod);
+
+    double F;
+    auto Pipeline = buildPipeline(C);
+    // llvm::errs() << "Pipeline: \n";
+    // for (const int n : C)
+    //   llvm::errs() << n << " ";
+    // llvm::errs() << "\n************\n";
+    // llvm::errs() << Pipeline << '\n';
+
+    if (auto Err = Consumer->ReemitOptimized(M.get(), buildPipeline(C)))
+      F = 0;
+    else {
+      F = getStatValue("LoopsVectorized");
+      F += getStatValue("NumBranchOpts");
+      F += getStatValue("NumConstantsHoisted");
+      F += getStatValue("NumInlined");
+      F += getStatValue("NumCombined");
+      F += getStatValue("NumHoisted");
+      F += getStatValue("NumMovedLoads");
+      F += getStatValue("NumUnrolled");
+      F += getStatValue("LoopsVectorized");
+      // F += getStatValue("NumSpills");
+      F += getStatValue("NumVectorized");
+    }
+
+    llvm::ResetStatistics();
+    return F;
+  }
+
+  double getStatValue(StringRef StatName) {
+    auto Stats = llvm::GetStatistics();
+    auto Stat = std::find_if(Stats.begin(), Stats.end(),
+                              [](const std::pair<StringRef, unsigned>& S) {
+                                  return std::get<0>(S) == "LoopsVectorized"; } );
+
+    double Value;
+    if (Stat != Stats.end())
+      Value = std::get<1>(*Stat);
+    else
+      Value = 0;
+
+    return Value;
   }
 
   void selectNewChromosomes() {
@@ -1613,8 +1676,6 @@ private:
 };
 
 std::vector<JITPass> OptimizationPasses;
-constexpr int PipelineSize = 1;
-int CurrentOpt = 0;
 
 void InitOptimizationPasses() {
   // 109 is the number of passes in PassRegistry.def
@@ -1983,6 +2044,13 @@ struct CompilerData {
             nullptr, 0, nullptr, 0, nullptr, 0, DeviceData, DevCnt, BestDevIdx));
       }
     }
+
+    // auto FileName = SourceMgr->getFileEntryForID(SourceMgr->getMainFileID())->getName();
+    // llvm::errs() << "got name\n";
+    // llvm::errs() << "JIT: file ID " << FileName << '\n';
+
+    // llvm::errs() << "JIT: Translation unit decl\n";
+    // Ctx->getTranslationUnitDecl()->dump();
 
     if (Invocation->getFrontendOpts().ShowStats || !Invocation->getFrontendOpts().StatsFile.empty())
       llvm::EnableStatistics(false);
@@ -2494,19 +2562,32 @@ struct CompilerData {
     // This is needed to pass the correct argument to the inlining pass
     Invocation->getCodeGenOpts().OptimizationLevel = 1;
 
-    if (VariantIdx == 0)
-      Invocation->getCodeGenOpts().OptimizationLevel = 3;
-    else {
+    if (VariantIdx < 3)
+      Invocation->getCodeGenOpts().OptimizationLevel = VariantIdx + 1;
+    else if (VariantIdx == 3) { // Genetic search
       JITPipeline JP;
       JP.buildPassPipeline(PassBuilder::OptimizationLevel::O3);
-      GeneticPipelineBuilder GPB(Consumer, 25, std::move(JP.Passes));
+      GeneticPipelineBuilder GPB(Consumer, 25, JP.Passes.size(), JP.Passes.size(), std::move(JP.Passes));
       GPB.Run();
-    }
+    } else if (VariantIdx == 4) { // Random search
 
-    // if (VariantIdx < 3)
-    //   Invocation->getCodeGenOpts().OptimizationLevel = VariantIdx + 1;
-    // else
-    //   PassPipeline = buildPassPipeline(VariantIdx);
+    } else if (VariantIdx == 5) { // Save the BC file
+      Invocation->getCodeGenOpts().OptimizationLevel = 0;
+      std::error_code EC;
+      std::string BCFileName = llvm::Twine("out.")
+                               .concat(llvm::Twine(Idx))
+                               .concat(llvm::Twine(".bc"))
+                               .str();
+
+      auto BCFile = llvm::make_unique<llvm::raw_fd_ostream>(BCFileName, EC);
+      if (EC) {
+        llvm::errs() << "Can't write bitcode to file\n";
+      } else {
+        llvm::Module* ToWriteMod = Consumer->getModule();
+        llvm::WriteBitcodeToFile(*ToWriteMod, *BCFile);
+      }
+    } else
+      Invocation->getCodeGenOpts().OptimizationLevel = 3;
 
     // Finalize the module, generate module-level metadata, etc.
 
@@ -2798,7 +2879,6 @@ struct CompilerData {
     if (Linker::linkModules(*RunningMod, Consumer->takeModule(),
                             Linker::Flags::OverrideFromSrc))
       fatal();
-
 
     StringRef StatsFile = Invocation->getFrontendOpts().StatsFile;
     if (!StatsFile.empty()) {
