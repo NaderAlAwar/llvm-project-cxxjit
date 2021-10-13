@@ -110,6 +110,7 @@
 #include <cassert>
 #include <cstdlib> // ::getenv
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <random>
 #include <string>
@@ -222,8 +223,36 @@ private:
   }
 };
 
-void fatal() {
-  report_fatal_error("Clang JIT failed!");
+std::string getBadPipelinesFile() {
+  char *ID = ::getenv("LLVM_JIT_BAD_PIPELINES_FILE");
+
+  return ID;
+}
+
+void saveBadPipeline(const std::string &PassPipeline) {
+  const std::string FileName = getBadPipelinesFile();
+  llvm::errs() << "Writing to " << FileName << '\n';
+  std::ofstream Output;
+
+  Output.open(FileName, std::ios_base::app);
+  if (!Output)
+    report_fatal_error("JIT: couldn't open bad pipelines file\n");
+
+  Output << PassPipeline << '\n';
+  Output.close();
+}
+
+int CurrentKernel = 0;
+std::string RandomPipeline = "";
+
+void fatal(const std::string &PassPipeline="") {
+  if (PassPipeline == "")
+    report_fatal_error("Clang JIT failed!");
+  else {
+    llvm::errs() << "CurrentKernel: " << CurrentKernel;
+    saveBadPipeline(PassPipeline);
+    report_fatal_error("Clang JIT failed, saved bad pipeline!");
+  }
 }
 
 // This is a variant of ORC's LegacyLookupFnResolver with a cutomized
@@ -1269,7 +1298,7 @@ public:
     addPass({"cg-profile", ModulePass});
 
     addPass({"globaldce", ModulePass});
-    addPass({"constmerge", ModulePass});
+    // addPass({"constmerge", ModulePass});
 
     addPass({"canonicalize-aliases", ModulePass});
     addPass({"name-anon-globals", ModulePass});
@@ -1375,6 +1404,77 @@ public:
     }
 
     return Pipeline;
+  }
+};
+
+std::set<std::string> BadPipelines;
+
+void readBadPipelines() {
+  const std::string FileName = getBadPipelinesFile();
+  llvm::errs() << "Reading from " << FileName << '\n';
+  std::ifstream Input;
+
+  Input.open(FileName);
+  if (!Input)
+    return;
+
+  if (Input.is_open()) {
+    std::string line;
+    while (std::getline(Input, line)) {
+      BadPipelines.insert(line);
+    }
+  }
+
+  Input.close();
+}
+
+class RandomPipelineBuilder {
+public:
+  RandomPipelineBuilder(
+      std::shared_ptr<BackendConsumer> &Consumer, size_t PipelineSize, size_t NumPasses,
+      std::vector<std::unique_ptr<JITMultiPass>> &&PassMap)
+    : Consumer(Consumer), PipelineSize(PipelineSize), NumPasses(NumPasses),
+      PassMap(std::move(PassMap)) { }
+
+  std::string Run() {
+    int iterations = 0;
+    bool isIn = true;
+    std::string StringPipeline = "";
+
+    while (isIn && iterations < 10) {
+      iterations++;
+      StringPipeline = generateRandomPipeline();
+      isIn = BadPipelines.find(StringPipeline) != BadPipelines.end();
+    }
+
+    if (iterations == 10)
+      report_fatal_error("Max iterations exceeded during random search");
+
+    return StringPipeline;
+  }
+
+private:
+  std::shared_ptr<BackendConsumer> Consumer;
+  size_t PipelineSize;
+  size_t NumPasses;
+  std::vector<std::unique_ptr<JITMultiPass>> PassMap; // Maps an integer to a Pass
+
+  std::string generateRandomPipeline() {
+    std::random_device RandomDevice;
+    std::mt19937 Engine{RandomDevice()};
+    std::uniform_int_distribution<int> Distribution{0, static_cast<int>(NumPasses) - 1};
+
+    auto Gen = [&Distribution, &Engine](){ return Distribution(Engine); };
+
+    std::vector<int> Pipeline(PipelineSize);
+    std::generate(std::begin(Pipeline), std::end(Pipeline), Gen);
+
+    JITPipeline JP;
+
+    for (int Pass : Pipeline)
+      JP.addMultiPass(*PassMap[Pass]);
+
+    return JP.toString();
   }
 };
 
@@ -2567,11 +2667,32 @@ struct CompilerData {
     else if (VariantIdx == 3) { // Genetic search
       JITPipeline JP;
       JP.buildPassPipeline(PassBuilder::OptimizationLevel::O3);
-      GeneticPipelineBuilder GPB(Consumer, 25, JP.Passes.size(), JP.Passes.size(), std::move(JP.Passes));
-      GPB.Run();
-    } else if (VariantIdx == 4) { // Random search
 
-    } else if (VariantIdx == 5) { // Save the BC file
+      GeneticPipelineBuilder GPB(Consumer, 25, JP.Passes.size(), JP.Passes.size(), std::move(JP.Passes));
+      PassPipeline = GPB.Run();
+    } else if (VariantIdx == 4) { // Random search
+      if (BadPipelines.size() == 0)
+        readBadPipelines();
+
+      JITPipeline JP;
+      JP.buildPassPipeline(PassBuilder::OptimizationLevel::O3);
+
+      RandomPipelineBuilder RPB(Consumer, 200, JP.Passes.size(), std::move(JP.Passes));
+      PassPipeline = RPB.Run();
+    } else if (VariantIdx == 5) { // Random search once
+      // if (BadPipelines.size() == 0)
+      //   readBadPipelines();
+
+      if (CurrentKernel == 0) {
+        JITPipeline JP;
+        JP.buildPassPipeline(PassBuilder::OptimizationLevel::O3);
+        RandomPipelineBuilder RPB(Consumer, 200, JP.Passes.size(), std::move(JP.Passes));
+        RandomPipeline = RPB.Run();
+      }
+
+      PassPipeline = RandomPipeline;
+      llvm::errs() << "Using pipeline: " << PassPipeline << '\n';
+    } else if (VariantIdx == 6) { // Save the BC file
       Invocation->getCodeGenOpts().OptimizationLevel = 0;
       std::error_code EC;
       std::string BCFileName = llvm::Twine("out.")
@@ -2585,6 +2706,21 @@ struct CompilerData {
       } else {
         llvm::Module* ToWriteMod = Consumer->getModule();
         llvm::WriteBitcodeToFile(*ToWriteMod, *BCFile);
+      }
+    } else if (VariantIdx == 7) { // Read the pipeline from an environment variable
+      PassPipeline = std::string(::getenv("LLVM_JIT_PIPELINE"));
+      llvm::errs() << "JIT: got pipeline " << PassPipeline << '\n';
+    } else if (VariantIdx == 8) { // Read the pipeline from an environment variable per kernel
+      std::string EnvironmentVariable = llvm::Twine("LLVM_JIT_PIPELINE_")
+                                        .concat(llvm::Twine(CurrentKernel))
+                                        .str();
+      auto EnvPipeline = std::string(::getenv(EnvironmentVariable.c_str()));
+
+      if (EnvPipeline == "O3")
+        Invocation->getCodeGenOpts().OptimizationLevel = 3;
+      else {
+        PassPipeline = EnvPipeline;
+        llvm::errs() << "JIT: got pipeline " << PassPipeline << '\n';
       }
     } else
       Invocation->getCodeGenOpts().OptimizationLevel = 3;
@@ -2814,7 +2950,7 @@ struct CompilerData {
 
     if (Linker::linkModules(*Consumer->getModule(), llvm::CloneModule(*RunningMod),
                             Linker::Flags::OverrideFromSrc))
-      fatal();
+      fatal(PassPipeline);
 
     // Aliases are not allowed to point to functions with available_externally linkage.
     // We solve this by replacing these aliases with the definition of the aliasee.
@@ -2878,7 +3014,7 @@ struct CompilerData {
     // OverrideFromSrc is needed here too, otherwise globals marked available_externally are not considered.
     if (Linker::linkModules(*RunningMod, Consumer->takeModule(),
                             Linker::Flags::OverrideFromSrc))
-      fatal();
+      fatal(PassPipeline);
 
     StringRef StatsFile = Invocation->getFrontendOpts().StatsFile;
     if (!StatsFile.empty()) {
@@ -2910,7 +3046,7 @@ struct CompilerData {
     assert(SpecSymbol && "Can't find the specialization just generated?");
 
     if (!SpecSymbol.getAddress())
-      fatal();
+      fatal(PassPipeline);
 
     return (void *) llvm::cantFail(SpecSymbol.getAddress());
   }
@@ -3085,6 +3221,7 @@ void *__clang_jit(const void *CmdArgs, unsigned CmdArgsLen,
   void *FPtr = CD->resolveFunction(NTTPValues, TypeStrings, Idx);
 
   {
+    CurrentKernel++;
     llvm::MutexGuard Guard(IMutex);
     Instantiations[InstInfo(InstKey, NTTPValues, NTTPValuesSize,
                             TypeStrings, TypeStringsCnt)] = FPtr;
